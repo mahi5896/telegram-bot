@@ -1,0 +1,148 @@
+import os
+import base64
+import time
+import re
+import subprocess
+import requests
+import telebot
+from bs4 import BeautifulSoup
+from gtts import gTTS
+from moviepy import TextClip, AudioFileClip
+from Crypto.Cipher import AES
+from telegram import Update, Document
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from PyPDF2 import PdfReader, PdfWriter
+
+# === CONFIG ===
+BOT_TOKEN = "7733479308:AAErpgHtjROpe5KuBieY46O4Vcf4V-g2fpI" 
+
+bot = telebot.TeleBot(BOT_TOKEN)
+ 
+@bot.message_handler(['start'])
+def start(message):
+    bot.reply_to(message,"Send me a .txt file or URL to convert it into a video!")
+
+AES_KEY = "thisis16bytekey!"  # Must be exactly 16 bytes
+EXPIRY_SECONDS = 3600  # 1 hour
+DATA_DIR = "data"
+DOWNLOADS_DIR = "downloads"
+URL_FILE = os.path.join(DATA_DIR, "urls.txt")
+
+# === SETUP DIRECTORIES ===
+os.makedirs(DATA_DIR, exist_ok=True)
+os.makedirs(DOWNLOADS_DIR, exist_ok=True)
+
+# === AES Helpers ===
+def pad(s): return s + chr(16 - len(s) % 16) * (16 - len(s) % 16)
+def unpad(s): return s[:-ord(s[-1])]
+def aes_encrypt(data, key):
+    cipher = AES.new(key.encode(), AES.MODE_ECB)
+    return base64.urlsafe_b64encode(cipher.encrypt(pad(data).encode())).decode()
+def aes_decrypt(data, key):
+    cipher = AES.new(key.encode(), AES.MODE_ECB)
+    return unpad(cipher.decrypt(base64.urlsafe_b64decode(data)).decode())
+
+# === URL Parser ===
+def parse_url(raw_url):
+    if 'HLS_KEY=' in raw_url:
+        base, key = raw_url.split('HLS_KEY=')
+        return {'type': 'm3u8', 'url': base.strip(), 'key': key.strip()}
+    elif 'pdfPSWD=' in raw_url:
+        base, pwd = raw_url.split('pdfPSWD=')
+        return {'type': 'pdf', 'url': base.strip(), 'password': pwd.strip()}
+    else:
+        return {'type': 'generic', 'url': raw_url.strip()}
+
+# === /uploadurls Handler ===
+async def upload_urls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.document:
+        return await update.message.reply_text("Please send a .txt file.")
+
+    file: Document = update.message.document
+    if not file.file_name.endswith(".txt"):
+        return await update.message.reply_text("Only .txt files are allowed.")
+
+    file_path = os.path.join(DATA_DIR, "urls.txt")
+    new_file = await file.get_file()
+    await new_file.download_to_drive(file_path)
+
+    await update.message.reply_text("File uploaded successfully. Encrypting URLs...")
+    await encrypt_urls(update, context)
+
+# === /encrypt Command ===
+async def encrypt_urls(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with open(URL_FILE, 'r') as f:
+            urls = f.read().splitlines()
+        msg = ""
+        for i, url in enumerate(urls, 1):
+            timestamp = int(time.time())
+            raw_data = f"{url}|{timestamp}"
+            enc = aes_encrypt(raw_data, AES_KEY)
+            msg += f"{i}. Encrypted: {enc}\n"
+        await update.message.reply_text(msg[:4000])  # Limit Telegram msg size
+    except Exception as e:
+        await update.message.reply_text(f"Error reading URLs: {e}")
+
+# === /decrypt <encrypted_string> ===
+async def decrypt_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        return await update.message.reply_text("Usage: /decrypt <encrypted_string>")
+    try:
+        dec = aes_decrypt(context.args[0], AES_KEY)
+        url, ts = dec.split("|")
+        if int(time.time()) - int(ts) > EXPIRY_SECONDS:
+            return await update.message.reply_text("Link expired.")
+        await update.message.reply_text(f"Decrypted URL: {url}")
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
+
+# === /downloadm3u8 Command ===
+async def download_m3u8(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with open(URL_FILE, 'r') as f:
+            for line in f:
+                item = parse_url(line)
+                if item['type'] == 'm3u8':
+                    out_path = os.path.join(DOWNLOADS_DIR, "video.mp4")
+                    subprocess.run(["streamlink", item['url'], "best", "-o", out_path], check=True)
+                    await update.message.reply_video(open(out_path, "rb"))
+                    os.remove(out_path)
+    except Exception as e:
+        await update.message.reply_text(f"Download error: {e}")
+
+# === /decryptpdf Command ===
+async def decrypt_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        with open(URL_FILE, 'r') as f:
+            for line in f:
+                item = parse_url(line)
+                if item['type'] == 'pdf':
+                    r = requests.get(item['url'])
+                    temp_pdf = os.path.join(DOWNLOADS_DIR, "temp.pdf")
+                    dec_pdf = os.path.join(DOWNLOADS_DIR, "decrypted.pdf")
+                    with open(temp_pdf, "wb") as f:
+                        f.write(r.content)
+                    reader = PdfReader(temp_pdf)
+                    if reader.is_encrypted:
+                        reader.decrypt(item['password'])
+                    writer = PdfWriter()
+                    for page in reader.pages:
+                        writer.add_page(page)
+                    with open(dec_pdf, "wb") as f:
+                        writer.write(f)
+                    await update.message.reply_document(open(dec_pdf, "rb"))
+                    os.remove(temp_pdf)
+                    os.remove(dec_pdf)
+    except Exception as e:
+        await update.message.reply_text(f"PDF Error: {e}")
+
+# === Start Bot ===
+if __name__ == "__main__":
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("encrypt", encrypt_urls))
+    app.add_handler(CommandHandler("decrypt", decrypt_link))
+    app.add_handler(CommandHandler("downloadm3u8", download_m3u8))
+    app.add_handler(CommandHandler("decryptpdf", decrypt_pdf))
+    app.add_handler(MessageHandler(filters.Document.ALL, upload_urls))
+    app.run_polling()
