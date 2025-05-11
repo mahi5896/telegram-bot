@@ -14,7 +14,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, Con
 from PyPDF2 import PdfReader, PdfWriter
 
 # === CONFIG ===
-BOT_TOKEN = "7733479308:AAErpgHtjROpe5KuBieY46O4Vcf4V-g2fpI" 
+BOT_TOKEN = "7733474125:AAErpgHtjROpe5KuBiergbkgnphfgO4Vcf4V-g2fpI" 
 
 bot = telebot.TeleBot(BOT_TOKEN)
  
